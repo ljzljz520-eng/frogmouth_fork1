@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Callable
 from webbrowser import open as open_url
 
-from httpx import URL, AsyncClient, HTTPStatusError, RequestError
+from httpx import URL, RequestError
 from markdown_it import MarkdownIt
 from mdit_py_plugins import front_matter
 from textual import work
@@ -20,7 +20,14 @@ from textual.widgets import Markdown
 from typing_extensions import Final
 
 from .. import __version__
-from ..dialogs import ErrorDialog
+from ..data import add_trusted_host, load_trusted_hosts
+from ..dialogs import ErrorDialog, YesNoDialog
+from ..security import (
+    GuardedFetcher,
+    HostBlocked,
+    RemoteFetchError,
+    RemoteFetchPolicy,
+)
 from ..utility.advertising import APPLICATION_TITLE, USER_AGENT
 
 PLACEHOLDER = f"""\
@@ -28,6 +35,31 @@ PLACEHOLDER = f"""\
 
 Welcome to {APPLICATION_TITLE}!
 """
+
+# Content types that we treat as viewable Markdown/plain text.
+VIEWABLE_CONTENT_TYPES: Final[frozenset[str]] = frozenset(
+    {
+        "text/plain",
+        "text/markdown",
+        "text/x-markdown",
+    }
+)
+
+_fetch_policy: RemoteFetchPolicy | None = None
+"""The process-wide remote fetch policy, seeded from persisted trust."""
+
+
+def get_fetch_policy() -> RemoteFetchPolicy:
+    """Get the shared remote fetch policy.
+
+    Returns:
+        The cached policy, creating it (and loading the persisted trusted
+        host exceptions) on first use.
+    """
+    global _fetch_policy  # pylint:disable=global-statement
+    if _fetch_policy is None:
+        _fetch_policy = RemoteFetchPolicy(trusted_hosts=load_trusted_hosts())
+    return _fetch_policy
 
 
 class History:
@@ -207,52 +239,98 @@ class Viewer(VerticalScroll, can_focus=True, can_focus_children=True):
         else:
             self._post_load(location, remember)
 
+    async def _prompt_trust_for_host(self, decision: HostBlocked) -> bool:
+        """Ask the user to explicitly exempt a blocked host.
+
+        Approving persists the host to the trusted hosts file; refusing
+        cancels the fetch.
+
+        Args:
+            decision: The policy decision that blocked the host.
+
+        Returns:
+            ``True`` if the user chose to trust (and save) the host.
+        """
+        addresses = "\n".join(
+            f"  - {address} ({'/'.join(categories) or 'public'})"
+            for address, categories in decision.addresses
+        )
+        approved = await self.app.push_screen_wait(
+            YesNoDialog(
+                "Trust this remote host?",
+                f"Host '{decision.host}' resolved to restricted network "
+                "addresses:\n\n"
+                f"{addresses}\n\n"
+                f"Reason: {decision.reason}.\n\n"
+                "Choose 'Trust & save' to contact it anyway and PERMANENTLY "
+                "add this host to the saved trusted hosts file. Choose "
+                "'Block' to cancel the fetch.",
+                yes_label="Trust & save",
+                no_label="Block",
+            )
+        )
+        if approved:
+            # The exemption is only ever written here, as the direct result
+            # of the user explicitly confirming the prompt.
+            add_trusted_host(decision.host)
+        return bool(approved)
+
     @work(exclusive=True)
     async def _remote_load(self, location: URL, remember: bool = True) -> None:
         """Load a Markdown document from a URL.
+
+        Every DNS resolution and every redirect hop is checked by the
+        remote fetch policy; blocked hosts are only contacted after an
+        explicit, persisted user exemption.
 
         Args:
             location: The location to load from.
             remember: Should we remember the location in the history?
         """
-
+        fetcher = GuardedFetcher(
+            get_fetch_policy(),
+            user_agent=USER_AGENT,
+            trust_prompter=self._prompt_trust_for_host,
+        )
         try:
-            async with AsyncClient() as client:
-                response = await client.get(
-                    location,
-                    follow_redirects=True,
-                    headers={"user-agent": USER_AGENT},
-                )
+            result = await fetcher.fetch(location)
+        except RemoteFetchError as error:
+            # A policy decision stopped the fetch; show the decision and
+            # whatever provenance we gathered to the user.
+            detail = str(error)
+            if error.report is not None and error.report.hops:
+                detail = f"{detail}\n\n{error.report.render_text()}"
+            self.app.push_screen(ErrorDialog("Remote fetch blocked", detail))
+            return
         except RequestError as error:
             self.app.push_screen(ErrorDialog("Error getting document", str(error)))
             return
 
-        try:
-            response.raise_for_status()
-        except HTTPStatusError as error:
-            self.app.push_screen(ErrorDialog("Error getting document", str(error)))
+        if not 200 <= result.status_code < 300:
+            self.app.push_screen(
+                ErrorDialog(
+                    "Error getting document",
+                    f"The server at {result.final_url} responded with status "
+                    f"{result.status_code}.",
+                )
+            )
             return
 
-        # There didn't seem to be an error transporting the data, and
-        # neither did there seem to be an error with the resource itself. So
-        # at this point we should hopefully have the document's content.
-        # However... it's possible we've been fooled into loading up
-        # something that looked like it was a markdown file, but really it's
-        # a web-rendering of such a file; so as a final check we make sure
+        # Transport and policy checks passed. As a final check make sure
         # we're looking at something that's plain text, or actually
-        # Markdown.
-        content_type = response.headers.get("content-type", "")
-        if any(
-            content_type.startswith(f"text/{sub_type}")
-            for sub_type in ("plain", "markdown", "x-markdown")
-        ):
-            self.document.update(response.text)
-            self._post_load(location, remember)
+        # Markdown. It's possible we've been fooled into loading up
+        # something that looked like it was a markdown file, but really
+        # it's a web-rendering of such a file.
+        if result.content_type in VIEWABLE_CONTENT_TYPES:
+            # Prefix the document with its redirect provenance and the
+            # policy decisions taken while fetching it.
+            self.document.update(f"{result.report.render_markdown()}\n\n{result.text}")
+            self._post_load(result.final_url, remember)
         else:
             # Didn't look like something we could handle with the Markdown
             # viewer. We could throw up an error, or we could just be nice
             # to the user. Let's be nice...
-            open_url(str(location))
+            open_url(str(result.final_url))
 
     def visit(self, location: Path | URL, remember: bool = True) -> None:
         """Visit a location.
